@@ -1,0 +1,9 @@
+[package]
+name = "pienirc-tokio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1.6.0"
+pienirc = { path = "../pienirc" }
+tokio = { version = "1.38.0", features = ["full"] }

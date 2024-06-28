@@ -1,0 +1,22 @@
+todo
+will start with client
+lookup common way to unit test
+tdd
+
+
+notes
+separating out tokio
+    have an IrcTransport trait
+        both a driver and driven port? well a port in any case
+        should it take and provide IrcMessages or bytes? will prob go with IrcMessage for ports-and-adapters testing reasons
+            but have an easy to use and common serializer and deserializer for normal implementations to use
+                writes are easy. just deserialize and write all the bytes to the buffered writer
+                for reads, take a Buf and return a Result<Some<>>
+                will get unit tested, since it's easy and otherwise gets no unit test coverage (but gets integration test coverage)
+
+
+no common connection struct between daemon and client
+    similar, but from a modeling perspective, they're different enough
+    daemon has a User that keeps track of state and holds the IrcTransport
+    client has Client that does the needful
+
