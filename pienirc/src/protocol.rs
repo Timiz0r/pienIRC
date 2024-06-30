@@ -21,52 +21,27 @@ pub struct Message {
     last_parameter: Option<String>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum Command {
-    Numeric(u32),
-    General(String),
-}
-
-#[derive(Debug)]
-pub enum Prefix {
-    // we could hypothetically handle all the forms of server
-    // but these are generally treated as a name, so no particular need
-    Server(String),
-    User(UserMask),
-}
-
-#[derive(Debug)]
-pub struct UserMask {
-    pub nickname: String,
-    pub user: String,
-    pub server: String,
-}
-
-#[derive(Debug)]
-pub struct ProtocolError {
-    source: Option<Box<dyn Error + Send + Sync>>,
-    reason: &'static str,
-}
-
-impl Error for ProtocolError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source.as_ref().map(|e| e.as_ref() as &_)
-    }
-}
-
-impl fmt::Display for ProtocolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.reason)
-    }
-}
-
 impl Message {
+    pub fn new_unchecked(
+        prefix: Option<Prefix>,
+        command: Command,
+        parameters: Option<Vec<String>>,
+        last_parameter: Option<String>,
+    ) -> Message {
+        Message {
+            prefix,
+            command,
+            parameters,
+            last_parameter,
+        }
+    }
+
     pub fn new(
         prefix: Option<Prefix>,
         command: Command,
         parameters: Option<Vec<String>>,
         last_parameter: Option<String>,
-    ) -> Result<Message, ProtocolError> {
+    ) -> Result<Message> {
         fn sp(s: &str) -> bool {
             // it may be more correct to check for "\r\n", but, since it's invalid anyway to have those chars,
             // might as well do it this way
@@ -102,6 +77,8 @@ impl Message {
                 reason: "Prefix has spaces, crlf, or starts with colon",
                 source: None,
             }),
+            // when it comes to parsing, excess parameters get treated as last_parameter
+            // but this is construction, where we would not expect there to be more than 14 of these kinds of parameters
             Some(ref p) if p.len() > 14 => Err(ProtocolError {
                 reason: "More than 14 parameters present",
                 source: None,
@@ -132,20 +109,6 @@ impl Message {
         }
     }
 
-    pub fn new_unchecked(
-        prefix: Option<Prefix>,
-        command: Command,
-        parameters: Option<Vec<String>>,
-        last_parameter: Option<String>,
-    ) -> Message {
-        Message {
-            prefix,
-            command,
-            parameters,
-            last_parameter,
-        }
-    }
-
     pub fn prefix(&self) -> &Option<Prefix> {
         &self.prefix
     }
@@ -162,7 +125,7 @@ impl Message {
         &self.last_parameter
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let len = Self::calc_len(
             &self.prefix,
             &self.command,
@@ -217,14 +180,36 @@ impl Message {
             })?;
         }
 
+        b.write_all(b"\r\n").map_err(|e| ProtocolError {
+            reason: "Unable to add crlf.",
+            source: Some(Box::new(e)),
+        })?;
+
         Ok(b)
     }
 
-    pub fn parse(input: &[u8]) -> Result<Option<(Message, usize)>, ProtocolError> {
-        // if we don't have a complete line, there's simply incomplete data in the buffer
-        // which is not an error
-        if !input.windows(2).any(|w| w == b"\r\n") {
+    pub fn parse(input: &[u8]) -> Result<Option<(Message, usize)>> {
+        let Some(size) = input.windows(2).position(|w| w == b"\r\n") else {
+            // if we don't have a complete line, there's simply incomplete data in the buffer
+            // which is not an error
             return Ok(None);
+        };
+
+        if size > 510 {
+            // crlf is remaining 2
+            // this is a bit of a predicament.
+            // if we return just an Err, we'd could end up in an infinite loop,
+            // since nothing could be pulled off the buffer.
+            // clearing out the long message here isn't what parse should be doing.
+            // and panicing...
+            //
+            // we'll go with a simple Err, and, this situation could surface when the buffer fills up.
+            // in the future, it may be necessary to more clearly indicate the failure in order to allow
+            // the caller to do the cleaning themselves.
+            return Err(ProtocolError {
+                reason: "The message, including the crlf, is more than 512 bytes.",
+                source: None,
+            });
         }
 
         // this is technically more permissive than the spec
@@ -295,7 +280,7 @@ impl Message {
                         .unwrap_or(None),
                     cap(&c, "lastparam"),
                 ),
-                c.get(0).unwrap().len(),
+                size,
             ))))
     }
 
@@ -328,8 +313,51 @@ impl Message {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum Command {
+    Numeric(u32),
+    General(String),
+}
+
+#[derive(Debug)]
+pub enum Prefix {
+    // we could hypothetically handle all the forms of server
+    // but these are generally treated as a name, so no particular need
+    Server(String),
+    User(UserMask),
+}
+
+#[derive(Debug)]
+pub struct UserMask {
+    pub nickname: String,
+    pub user: String,
+    pub server: String,
+}
+
+pub type Result<T> = std::result::Result<T, ProtocolError>;
+
+#[derive(Debug)]
+pub struct ProtocolError {
+    source: Option<Box<dyn Error + Send + Sync>>,
+    reason: &'static str,
+}
+
+impl Error for ProtocolError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_ref().map(|e| e.as_ref() as &_)
+    }
+}
+
+impl fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{iter, string::FromUtf8Error};
+
     use super::*;
 
     #[test]
@@ -446,6 +474,93 @@ mod tests {
             ),
             message
         );
+    }
+
+    #[test]
+    fn parse_size_512() -> std::result::Result<(), FromUtf8Error> {
+        let command = iter::repeat(b'A').take(510).collect::<Vec<u8>>();
+        let raw = [&command[..], &b"\r\n"[..]].concat();
+
+        let Ok(Some((message, _))) = Message::parse(&raw[..]) else {
+            panic!("Unable to parse 512-byte message")
+        };
+
+        assert_eq!(
+            Message::new_unchecked(
+                None,
+                Command::General(String::from_utf8(command)?),
+                None,
+                None
+            ),
+            message
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_size_over_512() {
+        let command = iter::repeat(b'A').take(511).collect::<Vec<u8>>();
+        let raw = [&command[..], &b"\r\n"[..]].concat();
+
+        if let Ok(Some((message, _))) = Message::parse(&raw[..]) {
+            panic!("Somehow parsed >512-byte message: {:?}", message)
+        }
+    }
+
+    #[test]
+    fn serialize_message() {
+        let message = Message::new_unchecked(
+            Some(Prefix::Server("server".to_string())),
+            Command::General("Command".to_string()),
+            Some(vec!["foo".to_string(), "bar".to_string()]),
+            Some("baz".to_string()),
+        );
+
+        assert_eq!(
+            b":server Command foo bar :baz\r\n",
+            &message.to_bytes().unwrap()[..]
+        );
+    }
+
+    #[test]
+    fn serialize_size_512_message() {
+        // we use all fields because we want to ensure everything is accounted for correctly
+        // it should be noted that we *could* save a byte if there are 14 middle parameters
+        // by dropping the colon of the last parameter, but this would be so unusual as to not be worth doing
+        // though not hard to do, to be fair.
+        let message = Message::new_unchecked(
+            Some(Prefix::Server("server".to_string())), //`:server `=8
+            Command::General("Command".to_string()),    //`Command`=7
+            Some(vec!["foo".to_string(), "bar".to_string()]), //` foo bar`=8
+            Some("q".repeat(512 - 8 - 7 - 8 - 2 - 2)),  // 2 for ` :`, 2 for crlf
+        );
+
+        let bytes = message.to_bytes().unwrap();
+
+        assert_eq!(512, bytes.len());
+        assert_eq!(512, bytes.capacity());
+    }
+
+    #[test]
+    fn serialize_over_size_512_message() {
+        // we use all fields because we want to ensure everything is accounted for correctly
+        // it should be noted that we *could* save a byte if there are 14 middle parameters
+        // by dropping the colon of the last parameter, but this would be so unusual as to not be worth doing
+        // though not hard to do, to be fair.
+        let message = Message::new_unchecked(
+            Some(Prefix::Server("server".to_string())), //`:server `=8
+            Command::General("Command".to_string()),    //`Command`=7
+            Some(vec!["foo".to_string(), "bar".to_string()]), //` foo bar`=8
+            Some("q".repeat(512 - 8 - 7 - 8 - 2 - 2 + 1)), // 2 for ` :`, 2 for crlf
+        );
+
+        if let Ok(bytes) = message.to_bytes() {
+            panic!(
+                "Somehow parsed >512-byte message: {:?}",
+                String::from_utf8_lossy(&bytes[..])
+            )
+        }
     }
 
     // these impls arent meant for public use but are convenient to use here
