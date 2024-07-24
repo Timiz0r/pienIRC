@@ -1,6 +1,4 @@
 use std::{
-    error::Error,
-    fmt,
     future::Future,
     io::{self, Write},
     sync::LazyLock,
@@ -8,9 +6,39 @@ use std::{
 
 use regex::bytes::{Captures, Regex};
 
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Failed to parse raw IRC message.")]
+    Parsing,
+
+    #[error("The message, including the crlf, is more than 512 bytes.")]
+    MessageTooLong,
+
+    #[error("Failed to serialize message: `{reason}`.")]
+    Serialization {
+        reason: &'static str,
+        #[source]
+        io_error: std::io::Error,
+    },
+
+    #[error("Prefix has spaces or crlf.")]
+    PrefixValidation,
+
+    #[error("Command has spaces, crlf, or starts with a colon.")]
+    CommandValidation,
+
+    #[error("More than 14 parameters present")]
+    SimpleParameterValidation,
+
+    #[error("Last parameter has crlf")]
+    LastParameterValidation,
+}
+
 pub trait Transport {
-    fn send(&mut self, message: Message) -> impl Future<Output = io::Result<()>>;
-    fn receive(&mut self) -> impl Future<Output = io::Result<Option<Message>>>;
+    fn send(&mut self, message: Message) -> impl Future<Output = io::Result<()>> + Send;
+    fn receive(&mut self) -> impl Future<Output = io::Result<Option<Message>>> + Send;
 }
 
 #[derive(Debug)]
@@ -49,56 +77,37 @@ impl Message {
         }
 
         match prefix {
-            Some(Prefix::Server(ref s)) if sp(s) => Err(ProtocolError {
-                reason: "Prefix has spaces or crlf",
-                source: None,
-            }),
+            Some(Prefix::Server(ref s)) if sp(s) => Err(Error::PrefixValidation),
             Some(Prefix::User(UserMask {
                 ref nickname,
                 ref user,
                 ref server,
-            })) if sp(nickname) || sp(user) || sp(server) => Err(ProtocolError {
-                reason: "Prefix has spaces or crlf",
-                source: None,
-            }),
+            })) if sp(nickname) || sp(user) || sp(server) => Err(Error::PrefixValidation),
             _ => Ok(()),
         }?;
 
         match command {
-            Command::General(ref c) if sp(c) => Err(ProtocolError {
-                reason: "Command has spaces or crlf",
-                source: None,
-            }),
+            Command::General(ref c) if sp(c) => Err(Error::PrefixValidation),
             _ => Ok(()),
         }?;
 
         match parameters {
-            Some(ref p) if p.iter().any(|p| sp(p) || p.starts_with(':')) => Err(ProtocolError {
-                reason: "Prefix has spaces, crlf, or starts with colon",
-                source: None,
-            }),
+            Some(ref p) if p.iter().any(|p| sp(p) || p.starts_with(':')) => {
+                Err(Error::CommandValidation)
+            }
             // when it comes to parsing, excess parameters get treated as last_parameter
             // but this is construction, where we would not expect there to be more than 14 of these kinds of parameters
-            Some(ref p) if p.len() > 14 => Err(ProtocolError {
-                reason: "More than 14 parameters present",
-                source: None,
-            }),
+            Some(ref p) if p.len() > 14 => Err(Error::SimpleParameterValidation),
             _ => Ok(()),
         }?;
 
         match last_parameter {
-            Some(ref s) if s.contains("\r\n") => Err(ProtocolError {
-                reason: "Last parameter has crlf",
-                source: None,
-            }),
+            Some(ref s) if s.contains("\r\n") => Err(Error::LastParameterValidation),
             _ => Ok(()),
         }?;
 
         if Self::calc_len(&prefix, &command, &parameters, &last_parameter) > 512 {
-            Err(ProtocolError {
-                reason: "Entire message is more than 512 bytes, including crlf.",
-                source: None,
-            })
+            Err(Error::MessageTooLong)
         } else {
             Ok(Message {
                 prefix,
@@ -133,10 +142,7 @@ impl Message {
             &self.last_parameter,
         );
         if len > 512 {
-            return Err(ProtocolError {
-                reason: "Entire message is more than 512 bytes, including crlf.",
-                source: None,
-            });
+            return Err(Error::MessageTooLong);
         }
 
         let mut b = Vec::with_capacity(len);
@@ -150,39 +156,39 @@ impl Message {
             })) => write!(b, ":{}!{}@{}", nickname, user, server),
             _ => Ok(()),
         }
-        .map_err(|e| ProtocolError {
-            reason: "Unable to format prefix.",
-            source: Some(Box::new(e)),
+        .map_err(|e| Error::Serialization {
+            reason: "Unable to write prefix.",
+            io_error: e,
         })?;
 
         match &self.command {
             Command::Numeric(n) => write!(b, "{:03}", n),
             Command::General(c) => b.write_all(c.as_bytes()),
         }
-        .map_err(|e| ProtocolError {
-            reason: "Unable to format command.",
-            source: Some(Box::new(e)),
+        .map_err(|e| Error::Serialization {
+            reason: "Unable to write command.",
+            io_error: e,
         })?;
 
         if let Some(p) = &self.parameters {
             for p in p.iter() {
-                write!(b, " {}", p).map_err(|e| ProtocolError {
-                    reason: "Unable to format parameters.",
-                    source: Some(Box::new(e)),
+                write!(b, " {}", p).map_err(|e| Error::Serialization {
+                    reason: "Unable to write parameters.",
+                    io_error: e,
                 })?;
             }
         };
 
         if let Some(p) = &self.last_parameter {
-            write!(b, " :{}", p).map_err(|e| ProtocolError {
-                reason: "Unable to format last parameter.",
-                source: Some(Box::new(e)),
+            write!(b, " :{}", p).map_err(|e| Error::Serialization {
+                reason: "Unable to write last parameter.",
+                io_error: e,
             })?;
         }
 
-        b.write_all(b"\r\n").map_err(|e| ProtocolError {
-            reason: "Unable to add crlf.",
-            source: Some(Box::new(e)),
+        b.write_all(b"\r\n").map_err(|e| Error::Serialization {
+            reason: "Unable to write crlf.",
+            io_error: e,
         })?;
 
         Ok(b)
@@ -206,10 +212,7 @@ impl Message {
             // we'll go with a simple Err, and, this situation could surface when the buffer fills up.
             // in the future, it may be necessary to more clearly indicate the failure in order to allow
             // the caller to do the cleaning themselves.
-            return Err(ProtocolError {
-                reason: "The message, including the crlf, is more than 512 bytes.",
-                source: None,
-            });
+            return Err(Error::MessageTooLong);
         }
 
         // this is technically more permissive than the spec
@@ -261,7 +264,7 @@ impl Message {
         // but this was an attempt to push the style hard. we can change it later if desired.
         R.captures(input)
             .filter(|c| c.get(0).map(|m| !m.is_empty()).unwrap_or(false))
-            .map_or(Err(ProtocolError{reason: "Unable parse message from bytes.", source: None}), |c| Ok(Some((
+            .map_or(Err(Error::Parsing), |c| Ok(Some((
                 Message::new_unchecked(
                     cap(&c, "nick")
                         .map(|n| Prefix::User(UserMask {
@@ -315,7 +318,7 @@ impl Message {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Command {
-    Numeric(u32),
+    Numeric(u16),
     General(String),
 }
 
@@ -334,29 +337,9 @@ pub struct UserMask {
     pub server: String,
 }
 
-pub type Result<T> = std::result::Result<T, ProtocolError>;
-
-#[derive(Debug)]
-pub struct ProtocolError {
-    source: Option<Box<dyn Error + Send + Sync>>,
-    reason: &'static str,
-}
-
-impl Error for ProtocolError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source.as_ref().map(|e| e.as_ref() as &_)
-    }
-}
-
-impl fmt::Display for ProtocolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.reason)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{iter, string::FromUtf8Error};
+    use std::{error::Error, iter};
 
     use super::*;
 
@@ -477,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_size_512() -> std::result::Result<(), FromUtf8Error> {
+    fn parse_size_512() -> std::result::Result<(), Box<dyn Error>> {
         let command = iter::repeat(b'A').take(510).collect::<Vec<u8>>();
         let raw = [&command[..], &b"\r\n"[..]].concat();
 
